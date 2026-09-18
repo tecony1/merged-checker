@@ -1,20 +1,18 @@
 #!/usr/bin/env node
 /**
- * combined-pair-watcher.mjs
+ * stonkfun-pair-watcher.mjs (v2 — quote-tokens endpoint)
  *
- * Merges the StonkFun and Sunrise watchers into one process. Each source
- * polls on its own schedule (StonkFun fast, Sunrise slow — it's a much
- * lower-frequency listing gateway), but they share ONE seen-mint registry.
+ * Switched from GET /api/public/v1/pairs to GET /api/quote-tokens, which
+ * appears to be the actual complete source of truth the StonkFun frontend
+ * uses for available quote tokens (stocks + memecoins), rather than a
+ * possibly-filtered/cached view. Confirmed via browser Network tab.
  *
- * Priority rule: whichever platform sees a given mint address first is
- * the one that gets to notify. If the same mint later shows up on the
- * other platform too, it's already in the shared registry, so the second
- * platform stays silent for it — no duplicate notifications.
- *
- * Setup: same TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars as before.
+ * Setup:
+ *   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (comma-separated for multiple
+ *   recipients, or a group/channel id) as env vars.
  *
  * Run:
- *   node combined-pair-watcher.mjs
+ *   node stonkfun-pair-watcher.mjs
  */
 
 import fs from 'node:fs';
@@ -24,27 +22,24 @@ import { fileURLToPath } from 'node:url';
 
 // ---- Config -----------------------------------------------------------
 
-const STONKFUN_API_BASE = 'https://www.stonkfun.xyz/api/public/v1';
-const SUNRISE_API_BASE = 'https://api.sunrise.xyz';
-
+const API_URL = 'https://www.stonkfun.xyz/api/quote-tokens';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 const TELEGRAM_CHAT_IDS = (process.env.TELEGRAM_CHAT_ID || 'YOUR_CHAT_ID_HERE')
   .split(',')
   .map((id) => id.trim())
   .filter(Boolean);
-
-const STONKFUN_POLL_INTERVAL_MS = Number(process.env.STONKFUN_POLL_INTERVAL_MS || 2_500);
-const SUNRISE_POLL_INTERVAL_MS = Number(process.env.SUNRISE_POLL_INTERVAL_MS || 30_000);
-const ONLY_LAUNCHABLE = process.env.ONLY_LAUNCHABLE === 'true'; // default false — unfiltered avoids extra upstream delay
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 2_500);
+const RUN_ONCE = process.env.RUN_ONCE === 'true';
 const PORT = process.env.PORT || 8000;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STATE_FILE = path.join(__dirname, 'combined-seen-mints.json');
+const STATE_FILE = path.join(__dirname, 'stonkfun-seen-quote-tokens.json');
 
-let lastCheckAt = { stonkfun: null, sunrise: null };
-let totals = { stonkfun: null, sunrise: null };
+let lastCheckAt = null;
+let lastNewPairCount = 0;
+let lastTotalCount = null;
 
-// ---- Shared seen-registry ------------------------------------------------------------
+// ---- Helpers ------------------------------------------------------------
 
 function loadSeen() {
   try {
@@ -59,16 +54,14 @@ function saveSeen(seenSet) {
   fs.writeFileSync(STATE_FILE, JSON.stringify([...seenSet], null, 2));
 }
 
-// Synchronous check-and-claim: since both sources' ticks run on the same
-// Node event loop and this function does no awaiting, there's no race
-// between StonkFun and Sunrise claiming the same mint simultaneously.
-function claimIfNew(seen, mint) {
-  if (seen.has(mint)) return false;
-  seen.add(mint);
-  return true;
+async function fetchQuoteTokens() {
+  const res = await fetch(API_URL);
+  const body = await res.json();
+  if (!res.ok) {
+    throw new Error(`${res.status}: request failed`);
+  }
+  return body.quoteTokens; // [{ quoteMint, symbol, name, category, launchLabReady, ... }]
 }
-
-// ---- Telegram ------------------------------------------------------------
 
 async function sendTelegramMessage(text) {
   if (TELEGRAM_CHAT_IDS.includes('YOUR_CHAT_ID_HERE') || TELEGRAM_BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
@@ -82,12 +75,7 @@ async function sendTelegramMessage(text) {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: 'Markdown',
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown', disable_web_page_preview: true }),
     });
     if (!res.ok) {
       const body = await res.text();
@@ -96,158 +84,89 @@ async function sendTelegramMessage(text) {
   }));
 }
 
-// ---- StonkFun source ------------------------------------------------------------
-
-async function fetchStonkfunPairs() {
-  const url = new URL(`${STONKFUN_API_BASE}/pairs`);
-  if (ONLY_LAUNCHABLE) url.searchParams.set('launchable', 'true');
-
-  const res = await fetch(url);
-  const body = await res.json();
-  if (!res.ok) {
-    throw new Error(`${body?.error?.code || res.status}: ${body?.error?.message || 'request failed'}`);
-  }
-  return body.data.pairs; // each has .mint
-}
-
-function formatStonkfunMessage(pair) {
+function formatMessage(token) {
   const lines = [
-    `🆕 *New pair — first seen on StonkFun*`,
-    `*${pair.symbol ?? pair.name ?? 'Unknown'}*${pair.name && pair.symbol ? ` — ${pair.name}` : ''}`,
-    `Mint: \`${pair.mint}\``,
-  ];
-  if (pair.category) lines.push(`Category: ${pair.category}`);
-  if (typeof pair.launchable === 'boolean') lines.push(`Launchable: ${pair.launchable}`);
-  return lines.join('\n');
-}
-
-async function tickStonkfun(seen, isFirstRun) {
-  let pairs;
-  try {
-    pairs = await fetchStonkfunPairs();
-  } catch (err) {
-    console.error('[error][stonkfun] fetching pairs:', err.message);
-    return;
-  }
-
-  lastCheckAt.stonkfun = new Date();
-  totals.stonkfun = pairs.length;
-
-  if (isFirstRun) {
-    for (const p of pairs) seen.add(p.mint);
-    saveSeen(seen);
-    console.log(`[init][stonkfun] Baseline recorded: ${pairs.length} existing pairs.`);
-    return;
-  }
-
-  let newCount = 0;
-  for (const pair of pairs) {
-    if (!claimIfNew(seen, pair.mint)) continue; // already claimed by this or the other source
-    newCount++;
-    console.log(`[${lastCheckAt.stonkfun.toISOString()}][stonkfun] NEW:`, pair.symbol || pair.name, pair.mint);
-    await sendTelegramMessage(formatStonkfunMessage(pair));
-  }
-  if (newCount > 0) saveSeen(seen);
-
-  console.log(`[${lastCheckAt.stonkfun.toISOString()}][stonkfun] Checked: ${pairs.length} total, ${newCount} new.`);
-}
-
-// ---- Sunrise source ------------------------------------------------------------
-
-async function fetchSunriseTokens() {
-  const tokens = [];
-  let cursor = null;
-
-  do {
-    const url = new URL(`${SUNRISE_API_BASE}/v1/tokens`);
-    if (cursor) url.searchParams.set('cursor', cursor);
-
-    const res = await fetch(url);
-    const body = await res.json();
-    if (!res.ok || !body.success) {
-      throw new Error(`${body?.error?.code || res.status}: ${body?.error?.message || 'request failed'}`);
-    }
-
-    tokens.push(...body.data.tokens); // each has .address
-    cursor = body.data.pagination.nextCursor;
-  } while (cursor);
-
-  return tokens;
-}
-
-function formatSunriseMessage(token) {
-  const lines = [
-    `🆕 *New pair — first seen on Sunrise*`,
+    `🆕 *New quote token available on StonkFun*`,
     `*${token.symbol}* — ${token.name}`,
-    `Mint: \`${token.address}\``,
-    `Platform: ${token.platform || 'unknown'}`,
+    `Mint: \`${token.quoteMint}\``,
+    `Category: ${token.category}`,
+    `Launch-ready: ${token.launchLabReady}`,
   ];
-  if (token.stock) {
-    lines.push(`Linked stock: *${token.stock.ticker}*${token.stock.exchange ? ` (${token.stock.exchange.name})` : ''}`);
-  }
+  if (token.verification) lines.push(`Verification: ${token.verification}`);
   return lines.join('\n');
 }
 
-async function tickSunrise(seen, isFirstRun) {
+// ---- Main loop ------------------------------------------------------------
+
+async function tick(seen, isFirstRun) {
   let tokens;
   try {
-    tokens = await fetchSunriseTokens();
+    tokens = await fetchQuoteTokens();
   } catch (err) {
-    console.error('[error][sunrise] fetching tokens:', err.message);
+    console.error('[error] fetching quote-tokens:', err.message);
     return;
   }
 
-  lastCheckAt.sunrise = new Date();
-  totals.sunrise = tokens.length;
+  const newTokens = tokens.filter((t) => !seen.has(t.quoteMint));
+  lastCheckAt = new Date();
+  lastNewPairCount = newTokens.length;
 
   if (isFirstRun) {
-    for (const t of tokens) seen.add(t.address);
+    for (const t of tokens) seen.add(t.quoteMint);
     saveSeen(seen);
-    console.log(`[init][sunrise] Baseline recorded: ${tokens.length} existing tokens.`);
+    lastTotalCount = tokens.length;
+    console.log(`[init] Baseline recorded: ${tokens.length} existing quote tokens. Watching for new ones...`);
     return;
   }
 
-  let newCount = 0;
-  for (const token of tokens) {
-    if (!claimIfNew(seen, token.address)) continue;
-    newCount++;
-    console.log(`[${lastCheckAt.sunrise.toISOString()}][sunrise] NEW:`, token.symbol, token.address);
-    await sendTelegramMessage(formatSunriseMessage(token));
+  const countChanged = lastTotalCount !== null && tokens.length !== lastTotalCount;
+  if (countChanged) {
+    console.log(`[${lastCheckAt.toISOString()}] TOTAL COUNT CHANGED: ${lastTotalCount} -> ${tokens.length}`);
   }
-  if (newCount > 0) saveSeen(seen);
+  lastTotalCount = tokens.length;
 
-  console.log(`[${lastCheckAt.sunrise.toISOString()}][sunrise] Checked: ${tokens.length} total, ${newCount} new.`);
+  if (newTokens.length === 0) {
+    console.log(`[${lastCheckAt.toISOString()}] No new quote tokens (${tokens.length} total).`);
+    return;
+  }
+
+  console.log(`[${lastCheckAt.toISOString()}] ${newTokens.length} new quote token(s) found!`);
+  for (const token of newTokens) {
+    console.log(' ->', token.symbol, token.quoteMint);
+    await sendTelegramMessage(formatMessage(token));
+    seen.add(token.quoteMint);
+  }
+  saveSeen(seen);
 }
-
-// ---- Health server + main ------------------------------------------------------------
 
 function startHealthServer() {
   const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', lastCheckAt, totals }));
+    res.end(JSON.stringify({ status: 'ok', lastCheckAt, lastNewPairCount, lastTotalCount }));
   });
   server.listen(PORT, () => console.log(`Health check server listening on :${PORT}`));
 }
 
 async function main() {
-  console.log('Combined StonkFun + Sunrise pair watcher starting...');
-  console.log(`StonkFun poll: every ${STONKFUN_POLL_INTERVAL_MS / 1000}s | Sunrise poll: every ${SUNRISE_POLL_INTERVAL_MS / 1000}s`);
+  console.log('StonkFun quote-token watcher starting...');
+  console.log(`Polling ${API_URL} every ${POLL_INTERVAL_MS / 1000}s`);
 
-  startHealthServer();
+  if (!RUN_ONCE) startHealthServer();
 
   let seen = loadSeen();
   const isFirstRun = seen === null;
   if (isFirstRun) seen = new Set();
 
-  await sendTelegramMessage('👋 Combined pair watcher started — watching StonkFun and Sunrise. Whichever sees a pair first gets the notification.');
+  await sendTelegramMessage('👋 StonkFun quote-token watcher just started up and is now watching for new quote tokens.');
 
-  // Bootstrap both sources' baselines before starting the loops, so we
-  // don't miss the "who's first" race on the very first real tick.
-  await tickStonkfun(seen, isFirstRun);
-  await tickSunrise(seen, isFirstRun);
+  await tick(seen, isFirstRun);
 
-  setInterval(() => tickStonkfun(seen, false), STONKFUN_POLL_INTERVAL_MS);
-  setInterval(() => tickSunrise(seen, false), SUNRISE_POLL_INTERVAL_MS);
+  if (RUN_ONCE) {
+    console.log('[done] RUN_ONCE set — exiting after single check.');
+    return;
+  }
+
+  setInterval(() => tick(seen, false), POLL_INTERVAL_MS);
 }
 
 main().catch((err) => {
